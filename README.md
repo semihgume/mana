@@ -223,7 +223,7 @@ backend = deepl
 deepl_key = 0123abcd-0000-0000-0000-000000000000:fx
 ```
 
-Uses the official DeepL API with your own key. Create a key in your DeepL account under API keys; the free plan is enough. Keys that end in `:fx` belong to the free plan and are sent to the free endpoint automatically.
+Uses the official DeepL API with your own key. Create a key in your DeepL account under API keys; the free plan is enough. Keys that end in `:fx` belong to the free plan and are sent to the free endpoint automatically. Keep the key private with `chmod 600 ~/.config/mana/config`; mana warns when other users can read a config file that holds a key.
 
 Notes:
 
@@ -257,6 +257,7 @@ Run mana from a terminal to see its messages: `mana --print "Hello"` for the tra
 | The popup opens as an ordinary window | The compositor does not support layer-shell (GNOME, for example). mana prints a warning and falls back to a normal window. |
 | The header reads `Google (DeepL failed)` | The DeepL request failed; the terminal output shows the HTTP status. 403 means a wrong key, 456 means the quota is used up, 429 means too many requests. |
 | "No network connection." or "The translation service did not answer in time." | The service could not be reached. The popup and `--print` give up after 15 seconds. |
+| "The translation service got too many requests from this computer." | The service is rate-limiting your connection (Google does this after many requests in a short time). It usually clears by itself within hours. |
 | My settings are ignored | If the file has problems, the popup shows the first one at the bottom (`Config: ...`, with `(+N more)` for the rest). Run `mana --print "Hello"` to see all of them with the file's path; if nothing is printed, check that the file is at the path given under [Configuration](#configuration). |
 | The popup closes by itself | It closes when it loses keyboard focus, for example when another window takes focus. |
 | The popup opens in an odd place | Delete `~/.local/state/mana/position`. |

@@ -82,7 +82,7 @@ pub fn main(init: std.process.Init) !void {
         .deepl_web => .deepl_web,
     };
 
-    if (!print_mode) try ui.run(arena, io, .{
+    if (!print_mode) ui.run(arena, io, .{
         .text = text,
         .problem = problem,
         .backend = backend,

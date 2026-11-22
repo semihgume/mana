@@ -75,18 +75,20 @@ const Popup = struct {
     gpa: Allocator,
     io: Io,
     request: Request,
-    loop: *c.GMainLoop,
-    window: *c.GtkWindow,
-    direction: *c.GtkLabel,
-    translation: *c.GtkLabel,
-    scroller: *c.GtkScrolledWindow,
-    copy_button: *c.GtkButton,
-    language: *c.GtkDropDown,
+    // The GTK objects are set in `show` once GTK runs, after the first
+    // translation has started; until then nothing may touch them.
+    loop: *c.GMainLoop = undefined,
+    window: *c.GtkWindow = undefined,
+    direction: *c.GtkLabel = undefined,
+    translation: *c.GtkLabel = undefined,
+    scroller: *c.GtkScrolledWindow = undefined,
+    copy_button: *c.GtkButton = undefined,
+    language: *c.GtkDropDown = undefined,
     /// The dropdown's list. GtkDropDown has no getter; it is a child widget.
-    language_list: ?*c.GtkPopover,
+    language_list: ?*c.GtkPopover = undefined,
     /// Widgets a drag may start on: the header row and the card's empty
     /// space, but not the text labels, so text selection keeps working.
-    drag_handles: [4]*c.GtkWidget,
+    drag_handles: [4]*c.GtkWidget = undefined,
     /// Bumped for every translation request; older results are dropped.
     generation: u32 = 0,
     translated: ?[:0]const u8 = null,
@@ -106,8 +108,12 @@ const Job = struct {
     generation: u32,
     /// `null` applies the smart rule.
     target: ?[]const u8,
-    /// Written by the worker thread before it schedules `onResult`.
+    /// Written by the worker thread before it lets `onResult` be scheduled.
     outcome: Outcome = undefined,
+    /// Steps still missing before `onResult` may run: the worker finishing,
+    /// and `watch`, which is only called once the widgets exist. The step
+    /// that comes last schedules it (`stepDone`).
+    steps_left: std.atomic.Value(u8) = .init(2),
     /// Set on the main thread once `onResult` has run.
     done: bool = false,
 };
@@ -118,8 +124,23 @@ const Outcome = union(enum) {
 };
 
 /// Shows the popup and runs the GTK main loop. Exits the process when the
-/// popup closes; returns only if the UI cannot be started.
-pub fn run(gpa: Allocator, io: Io, request: Request) !noreturn {
+/// popup closes, and with status 1 when the UI cannot be started.
+pub fn run(gpa: Allocator, io: Io, request: Request) noreturn {
+    show(gpa, io, request) catch |err| {
+        // The first translation's worker may be using `gpa` and `io`
+        // already: exit instead of returning from `main`.
+        std.log.err("{t}", .{err});
+        std.process.exit(1);
+    };
+}
+
+fn show(gpa: Allocator, io: Io, request: Request) !noreturn {
+    const popup = try gpa.create(Popup);
+    popup.* = .{ .gpa = gpa, .io = io, .request = request };
+    // The request needs no widgets, so it runs while GTK starts up; if it
+    // cannot be started here, the normal path below tries again.
+    const first_job = if (request.problem == null) startJob(popup, request.options.forced_target) catch null else null;
+
     if (c.gtk_init_check() == 0) return error.CannotOpenDisplay;
 
     const provider = c.gtk_css_provider_new();
@@ -195,21 +216,16 @@ pub fn run(gpa: Allocator, io: Io, request: Request) !noreturn {
         c.gtk_box_append(@ptrCast(card), widget(notice));
     }
 
-    const popup = try gpa.create(Popup);
-    popup.* = .{
-        .gpa = gpa,
-        .io = io,
-        .request = request,
-        .loop = c.g_main_loop_new(null, 0).?,
-        .window = window,
-        .direction = direction,
-        .translation = translation,
-        .scroller = @ptrCast(scroller),
-        .copy_button = copy_button,
-        .language = language.dropdown,
-        .language_list = language.list,
-        .drag_handles = .{ widget(window), card, header, widget(direction) },
-    };
+    // Field by field: a worker may be reading the other fields.
+    popup.loop = c.g_main_loop_new(null, 0).?;
+    popup.window = window;
+    popup.direction = direction;
+    popup.translation = translation;
+    popup.scroller = @ptrCast(scroller);
+    popup.copy_button = copy_button;
+    popup.language = language.dropdown;
+    popup.language_list = language.list;
+    popup.drag_handles = .{ widget(window), card, header, widget(direction) };
 
     const keys = c.gtk_event_controller_key_new();
     // Capture phase, so Ctrl+C reaches us before the selectable label handles it.
@@ -241,7 +257,7 @@ pub fn run(gpa: Allocator, io: Io, request: Request) !noreturn {
         c.gtk_widget_set_visible(widget(copy_button), 0);
         showError(popup, try gpa.dupeSentinel(u8, message, 0));
     } else {
-        translateTo(popup, request.options.forced_target);
+        if (first_job) |job| watch(job) else translateTo(popup, request.options.forced_target);
         connect(language.dropdown, "notify::selected", &onLanguageSelected, popup);
     }
 
@@ -332,27 +348,49 @@ fn languageName(gpa: Allocator, code: []const u8) Allocator.Error![:0]const u8 {
 
 /// Starts translating the original text into `target` (`null`: smart rule).
 fn translateTo(popup: *Popup, target: ?[]const u8) void {
-    popup.generation +%= 1;
     popup.translated = null;
     c.gtk_widget_remove_css_class(widget(popup.translation), "error");
     c.gtk_label_set_text(popup.translation, "Translating…");
     c.gtk_button_set_label(popup.copy_button, "Copy");
     c.gtk_widget_set_sensitive(widget(popup.copy_button), 0);
 
-    const job = popup.gpa.create(Job) catch return showError(popup, "Translation failed (OutOfMemory).");
-    job.* = .{ .popup = popup, .generation = popup.generation, .target = target };
-    const thread = std.Thread.spawn(.{}, work, .{job}) catch |err| {
+    const job = startJob(popup, target) catch |err| {
         return showError(popup, translator.describeError(popup.gpa, err) catch "Translation failed.");
     };
+    watch(job);
+}
+
+/// Starts a worker that translates into `target`; its result is dropped
+/// unless it is still the latest request. Touches no widgets, so it also
+/// works before GTK is initialized. The result is shown only after `watch`.
+fn startJob(popup: *Popup, target: ?[]const u8) !*Job {
+    popup.generation +%= 1;
+    const job = try popup.gpa.create(Job);
+    job.* = .{ .popup = popup, .generation = popup.generation, .target = target };
+    const thread = try std.Thread.spawn(.{}, work, .{job});
     thread.detach();
+    return job;
+}
+
+/// Lets `job`'s result reach the widgets, which must exist by now, and
+/// starts its timeout.
+fn watch(job: *Job) void {
     _ = c.g_timeout_add_seconds(translator.request_timeout, onTimeout, job);
+    stepDone(job);
 }
 
 fn work(job: *Job) void {
     job.outcome = translate(job) catch |err| .{
         .failed = translator.describeError(job.popup.gpa, err) catch "Translation failed.",
     };
-    _ = c.g_idle_add(onResult, job);
+    stepDone(job);
+}
+
+/// Called by the worker and by `watch`, on different threads; the second
+/// call schedules `onResult` on the main loop.
+fn stepDone(job: *Job) void {
+    // acq_rel: whoever comes second sees the worker's `outcome`.
+    if (job.steps_left.fetchSub(1, .acq_rel) == 1) _ = c.g_idle_add(onResult, job);
 }
 
 fn translate(job: *Job) !Outcome {
@@ -664,25 +702,36 @@ fn copy(popup: *Popup) void {
     else
         text;
 
-    // wl-copy forks a background process that serves the clipboard until it
-    // is replaced; no inherited stdio, so it cannot keep a caller's pipe open.
-    var child = std.process.spawn(popup.io, .{
-        .argv = &.{ "wl-copy", "--", selected },
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    }) catch |err| {
-        std.debug.print("Could not run wl-copy: {t}\n", .{err});
-        c.gtk_button_set_label(popup.copy_button, "Copy failed");
-        return;
-    };
-    const term = child.wait(popup.io) catch |err| {
+    const term = runWlCopy(popup.io, "wl-copy", selected) catch |err| {
         std.debug.print("wl-copy failed: {t}\n", .{err});
         c.gtk_button_set_label(popup.copy_button, "Copy failed");
         return;
     };
-    const ok = term == .exited and term.exited == 0;
-    c.gtk_button_set_label(popup.copy_button, if (ok) "Copied" else "Copy failed");
+    c.gtk_button_set_label(popup.copy_button, if (term.success()) "Copied" else "Copy failed");
+}
+
+/// Runs wl-copy (`program`) with `text` on its standard input. Not as an
+/// argument: other users could see that in the process list, and a long text
+/// would hit the argument size limit.
+fn runWlCopy(io: Io, program: []const u8, text: []const u8) !std.process.Child.Term {
+    // wl-copy forks a background process that serves the clipboard until it
+    // is replaced. It inherits no stdout/stderr, so it cannot keep a caller's
+    // pipe open, and stdin is closed before waiting.
+    var child = try std.process.spawn(io, .{
+        // An explicit type: from stdin, wl-copy would otherwise guess one with
+        // xdg-mime, and text that looks like HTML could be offered as HTML.
+        .argv = &.{ program, "--type", "text/plain;charset=utf-8" },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer child.kill(io); // Reaps the child when writing failed; no-op after `wait`.
+    const stdin = child.stdin.?;
+    child.stdin = null;
+    const written = stdin.writeStreamingAll(io, text);
+    stdin.close(io);
+    try written;
+    return child.wait(io);
 }
 
 fn byteOffset(text: []const u8, char_offset: usize) usize {
@@ -746,6 +795,56 @@ test translationCap {
     try std.testing.expectEqual(500 - top_margin - 156, translationCap(500, 156));
     // Tiny: never below the minimum.
     try std.testing.expectEqual(min_translation_height, translationCap(200, 156));
+}
+
+test runWlCopy {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Fake wl-copy scripts that record stdin and argv next to themselves. The
+    // real one is never run: it would replace the user's clipboard.
+    const record = "#!/bin/sh\nexec 3<&0\ncat > \"$0.stdin\"\nprintf '%s\\n' \"$@\" > \"$0.args\"\n";
+    const scripts = [_][2][]const u8{
+        .{ "ok", record },
+        .{ "fails", record ++ "exit 3\n" },
+        // Forks like wl-copy: the background process keeps stdin, stdout and
+        // stderr open (sh would give it /dev/null as stdin, hence fd 3).
+        .{ "forks", record ++ "sleep 5 <&3 &\n" },
+    };
+    for (scripts) |script| try tmp.dir.writeFile(io, .{
+        .sub_path = script[0],
+        .data = script[1],
+        .flags = .{ .permissions = .executable_file },
+    });
+
+    const big = try gpa.alloc(u8, 300 * 1024);
+    defer gpa.free(big);
+    const pattern = "Merhaba dünya, 日本語 -- \n";
+    for (big, 0..) |*b, i| b.* = pattern[i % pattern.len];
+    const texts = [_][]const u8{ "Hello", "Güzel gün → 日本語", "--help -t x", "\n", "", big };
+
+    const ok = try tmp.dir.realPathFileAlloc(io, "ok", gpa);
+    defer gpa.free(ok);
+    for (texts) |text| {
+        try std.testing.expect((try runWlCopy(io, ok, text)).success());
+        const stdin = try tmp.dir.readFileAlloc(io, "ok.stdin", gpa, .unlimited);
+        defer gpa.free(stdin);
+        try std.testing.expectEqualSlices(u8, text, stdin);
+        const args = try tmp.dir.readFileAlloc(io, "ok.args", gpa, .unlimited);
+        defer gpa.free(args);
+        try std.testing.expectEqualStrings("--type\ntext/plain;charset=utf-8\n", args);
+    }
+
+    const fails = try tmp.dir.realPathFileAlloc(io, "fails", gpa);
+    defer gpa.free(fails);
+    try std.testing.expect(!(try runWlCopy(io, fails, "Hello")).success());
+
+    const forks = try tmp.dir.realPathFileAlloc(io, "forks", gpa);
+    defer gpa.free(forks);
+    const start: Io.Clock.Timestamp = .now(io, .awake);
+    try std.testing.expect((try runWlCopy(io, forks, big)).success());
+    try std.testing.expect(start.untilNow(io).raw.toMilliseconds() < 2000);
 }
 
 test previewText {

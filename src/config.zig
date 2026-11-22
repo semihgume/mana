@@ -79,8 +79,9 @@ pub fn parse(arena: Allocator, text: []const u8, warnings: *std.ArrayList([]cons
 /// Any other read problem and every parse warning is printed to stderr with
 /// std.debug.print prefixed "mana: config: ", and defaults/partial config are
 /// returned. The same problems are appended to `problems` as short messages
-/// without the file's path, for the popup. Never returns an error to the
-/// caller except OutOfMemory.
+/// without the file's path, for the popup, as is a warning when the file
+/// holds an API key and other users can read it. Never returns an error to
+/// the caller except OutOfMemory.
 pub fn load(
     arena: Allocator,
     io: Io,
@@ -98,7 +99,7 @@ pub fn load(
         return .{};
     };
 
-    const text = Io.Dir.cwd().readFileAlloc(io, config_path, arena, .limited(max_file_size)) catch |err| switch (err) {
+    const text, const mode = readFile(arena, io, config_path) catch |err| switch (err) {
         error.FileNotFound => return .{},
         error.OutOfMemory => return error.OutOfMemory,
         else => {
@@ -110,8 +111,30 @@ pub fn load(
 
     const first = problems.items.len;
     const config = try parse(arena, text, problems);
+    if (config.deepl_key != null and mode != null and othersHaveAccess(mode.?)) {
+        try problems.append(arena, "the file holds an API key but other users can read it (chmod 600)");
+    }
     for (problems.items[first..]) |warning| std.debug.print("mana: config: {s}: {s}\n", .{ config_path, warning });
     return config;
+}
+
+/// The file's contents and its mode, taken from the open handle (`null` when
+/// stat fails).
+fn readFile(arena: Allocator, io: Io, path: []const u8) !struct { []u8, ?std.posix.mode_t } {
+    const file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    const text = reader.interface.allocRemaining(arena, .limited(max_file_size)) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        else => |e| return e,
+    };
+    const stat = file.stat(io) catch return .{ text, null };
+    return .{ text, stat.permissions.toMode() };
+}
+
+/// Whether the group or other users have any access to a file with this mode.
+fn othersHaveAccess(mode: std.posix.mode_t) bool {
+    return mode & 0o077 != 0;
 }
 
 const testing = std.testing;
@@ -214,6 +237,14 @@ test "parse: empty deepl_key is null" {
     const config = try parse(arena.allocator(), "deepl_key =   \n", &warnings);
     try testing.expectEqual(0, warnings.items.len);
     try testing.expectEqual(null, config.deepl_key);
+}
+
+test othersHaveAccess {
+    try testing.expect(!othersHaveAccess(0o100600));
+    try testing.expect(!othersHaveAccess(0o400));
+    try testing.expect(othersHaveAccess(0o100644));
+    try testing.expect(othersHaveAccess(0o640));
+    try testing.expect(othersHaveAccess(0o602));
 }
 
 test "load: missing file gives defaults" {

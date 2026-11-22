@@ -37,13 +37,15 @@ pub const Backend = union(enum) {
     deepl: struct { key: []const u8 },
     deepl_web,
 
-    pub fn translate(backend: Backend, gpa: Allocator, io: Io, text: []const u8, target_lang: []const u8) !Translation {
+    /// Sends its requests through `client`, whose pooled connections a later
+    /// request to the same host reuses.
+    pub fn translate(backend: Backend, gpa: Allocator, client: *std.http.Client, text: []const u8, target_lang: []const u8) !Translation {
         return switch (backend) {
-            .google => google.translate(gpa, io, text, target_lang),
-            .deepl => |d| deepl.translate(gpa, io, d.key, text, target_lang) catch |err|
-                fallBackToGoogle(gpa, io, err, "DeepL", text, target_lang),
-            .deepl_web => deepl_web.translate(gpa, io, text, target_lang) catch |err|
-                fallBackToGoogle(gpa, io, err, "DeepL web", text, target_lang),
+            .google => google.translate(gpa, client, text, target_lang),
+            .deepl => |d| deepl.translate(gpa, client, d.key, text, target_lang) catch |err|
+                fallBackToGoogle(gpa, client, err, "DeepL", text, target_lang),
+            .deepl_web => deepl_web.translate(gpa, client, text, target_lang) catch |err|
+                fallBackToGoogle(gpa, client, err, "DeepL web", text, target_lang),
         };
     }
 };
@@ -64,7 +66,7 @@ pub fn describeError(gpa: Allocator, err: anyerror) Allocator.Error![:0]const u8
         error.TooManyRequests => "The translation service got too many requests from this computer. Try again later.",
         error.ServiceRefused => "The translation service refused the request.",
         error.ServiceUnavailable => "The translation service is not available right now. Try again later.",
-        error.UnexpectedResponse => "The translation service sent an unexpected response.",
+        error.UnexpectedResponse, error.ResponseTooLarge => "The translation service sent an unexpected response.",
         else => gpa.printSentinel("Translation failed ({t}).", .{err}, 0),
     };
 }
@@ -80,11 +82,63 @@ fn statusError(status: std.http.Status) error{ TextTooLong, TooManyRequests, Ser
     };
 }
 
+/// The most a translation service may send back; far more than any real
+/// answer. A larger body stops the download, so a broken or hostile server
+/// cannot fill memory.
+const max_response_size = 4 * 1024 * 1024;
+
+/// `client.fetch` that collects the response body, at most `max_response_size`
+/// bytes of it; more is error.ResponseTooLarge.
+fn fetch(gpa: Allocator, client: *std.http.Client, options: std.http.Client.FetchOptions) !struct { status: std.http.Status, body: []u8 } {
+    var buffer: [4096]u8 = undefined;
+    var body: CappedWriter = .init(gpa, max_response_size, &buffer);
+    var with_body = options;
+    with_body.response_writer = &body.writer;
+    // Uncompressed, so the body is read to its very end and the connection
+    // goes back to the client's pool for the next request. std stops reading
+    // a compressed chunked body when the compressed data ends, before the
+    // closing chunk, and then closes the connection instead.
+    with_body.headers.accept_encoding = .{ .override = "identity" };
+    const response = client.fetch(with_body) catch |err| switch (err) {
+        error.WriteFailed => return if (body.too_large) error.ResponseTooLarge else err,
+        else => |e| return e,
+    };
+    body.writer.flush() catch return if (body.too_large) error.ResponseTooLarge else error.OutOfMemory;
+    return .{ .status = response.status, .body = body.out.written() };
+}
+
+/// Collects everything written into `out` and fails with error.WriteFailed,
+/// setting `too_large`, as soon as the total would pass `limit` bytes.
+const CappedWriter = struct {
+    out: Io.Writer.Allocating,
+    limit: usize,
+    too_large: bool = false,
+    writer: Io.Writer,
+
+    fn init(gpa: Allocator, limit: usize, buffer: []u8) CappedWriter {
+        return .{ .out = .init(gpa), .limit = limit, .writer = .{ .buffer = buffer, .vtable = &.{ .drain = drain } } };
+    }
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const capped: *CappedWriter = @alignCast(@fieldParentPtr("writer", w));
+        const count = Io.Writer.countSplat(data, splat);
+        if (capped.out.written().len + w.end + count > capped.limit) {
+            capped.too_large = true;
+            return error.WriteFailed;
+        }
+        try capped.out.writer.writeAll(w.buffered());
+        w.end = 0;
+        for (data[0 .. data.len - 1]) |bytes| try capped.out.writer.writeAll(bytes);
+        try capped.out.writer.splatBytesAll(data[data.len - 1], splat);
+        return count;
+    }
+};
+
 /// Answers a failed DeepL request with Google, except when memory ran out.
-fn fallBackToGoogle(gpa: Allocator, io: Io, err: anyerror, name: []const u8, text: []const u8, target_lang: []const u8) !Translation {
+fn fallBackToGoogle(gpa: Allocator, client: *std.http.Client, err: anyerror, name: []const u8, text: []const u8, target_lang: []const u8) !Translation {
     if (err == error.OutOfMemory) return error.OutOfMemory;
     std.debug.print("{s} failed ({t}), falling back to Google\n", .{ name, err });
-    var result = try google.translate(gpa, io, text, target_lang);
+    var result = try google.translate(gpa, client, text, target_lang);
     result.fell_back = .of(err);
     return result;
 }
@@ -99,11 +153,23 @@ pub const Options = struct {
 /// Translates into the primary language, or into the secondary one when the
 /// text already is in the primary language.
 pub fn translateSmart(backend: Backend, gpa: Allocator, io: Io, text: []const u8, options: Options) !Translation {
-    if (options.forced_target) |target| return backend.translate(gpa, io, text, target);
+    // One client for every request of this translation: the second request
+    // of the smart rule reuses the first one's connection instead of setting
+    // up TCP and TLS again (and the CA bundle is loaded once).
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
 
-    const first = try backend.translate(gpa, io, text, options.primary_lang);
+    if (options.forced_target) |target| return backend.translate(gpa, &client, text, target);
+
+    const first = try backend.translate(gpa, &client, text, options.primary_lang);
     if (!sameLanguage(first.source_lang, options.primary_lang)) return first;
-    return backend.translate(gpa, io, text, options.secondary_lang);
+    // A DeepL backend that just failed is not asked a second time.
+    if (first.fell_back) |reason| {
+        var second = try google.translate(gpa, &client, text, options.secondary_lang);
+        second.fell_back = reason;
+        return second;
+    }
+    return backend.translate(gpa, &client, text, options.secondary_lang);
 }
 
 /// Compares only the base language, so "zh-CN" matches "zh".
@@ -114,7 +180,7 @@ fn sameLanguage(a: []const u8, b: []const u8) bool {
 }
 
 const google = struct {
-    fn translate(gpa: Allocator, io: Io, text: []const u8, target_lang: []const u8) !Translation {
+    fn translate(gpa: Allocator, client: *std.http.Client, text: []const u8, target_lang: []const u8) !Translation {
         const url = try gpa.print("https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&dt=t&tl={s}", .{target_lang});
         // The text goes in a form-encoded POST body: in the URL, the server
         // answers HTTP 400 somewhere above 6000 characters.
@@ -122,23 +188,20 @@ const google = struct {
         try payload.writer.writeAll("q=");
         try std.Uri.Component.percentEncode(&payload.writer, text, isUnreserved);
 
-        var client: std.http.Client = .{ .allocator = gpa, .io = io };
-        defer client.deinit();
-
-        var body: Io.Writer.Allocating = .init(gpa);
-        const response = try client.fetch(.{
+        const response = try fetch(gpa, client, .{
             .location = .{ .url = url },
             .method = .POST,
             .payload = payload.written(),
             .headers = .{ .content_type = .{ .override = "application/x-www-form-urlencoded" } },
-            .response_writer = &body.writer,
         });
         if (response.status != .ok) {
             std.debug.print("Google request failed: HTTP {d}\n", .{@backingInt(response.status)});
+            // Google rate-limits by redirecting to its "sorry" captcha page.
+            if (response.status == .found) return error.TooManyRequests;
             return statusError(response.status);
         }
 
-        const result = try parseResponse(gpa, body.written());
+        const result = try parseResponse(gpa, response.body);
         return .{ .text = result.text, .source_lang = result.source_lang, .target_lang = target_lang, .service = .google };
     }
 
@@ -171,15 +234,11 @@ const google = struct {
 };
 
 const deepl = struct {
-    fn translate(gpa: Allocator, io: Io, key: []const u8, text: []const u8, target_lang: []const u8) !Translation {
+    fn translate(gpa: Allocator, client: *std.http.Client, key: []const u8, text: []const u8, target_lang: []const u8) !Translation {
         const payload = try requestBody(gpa, text, try targetCode(gpa, target_lang));
         const authorization = try gpa.print("DeepL-Auth-Key {s}", .{key});
 
-        var client: std.http.Client = .{ .allocator = gpa, .io = io };
-        defer client.deinit();
-
-        var body: Io.Writer.Allocating = .init(gpa);
-        const response = try client.fetch(.{
+        const response = try fetch(gpa, client, .{
             .location = .{ .url = endpoint(key) },
             .method = .POST,
             .payload = payload,
@@ -187,14 +246,13 @@ const deepl = struct {
                 .authorization = .{ .override = authorization },
                 .content_type = .{ .override = "application/json" },
             },
-            .response_writer = &body.writer,
         });
         if (response.status != .ok) {
             std.debug.print("DeepL request failed: HTTP {d}\n", .{@backingInt(response.status)});
             return statusError(response.status);
         }
 
-        const result = try parseResponse(gpa, body.written());
+        const result = try parseResponse(gpa, response.body);
         return .{ .text = result.text, .source_lang = result.source_lang, .target_lang = target_lang, .service = .deepl };
     }
 
@@ -254,16 +312,12 @@ const deepl_web = struct {
     /// Anonymous requests are capped at 1500 UTF-16 code units of text.
     const max_text_len = 1500;
 
-    fn translate(gpa: Allocator, io: Io, text: []const u8, target_lang: []const u8) !Translation {
+    fn translate(gpa: Allocator, client: *std.http.Client, text: []const u8, target_lang: []const u8) !Translation {
         const text_len = std.unicode.calcUtf16LeLen(text) catch text.len;
         if (text_len > max_text_len) return error.TextTooLong;
         const payload = try deepl.requestBody(gpa, text, try targetCode(gpa, target_lang));
 
-        var client: std.http.Client = .{ .allocator = gpa, .io = io };
-        defer client.deinit();
-
-        var body: Io.Writer.Allocating = .init(gpa);
-        const response = try client.fetch(.{
+        const response = try fetch(gpa, client, .{
             .location = .{ .url = endpoint },
             .method = .POST,
             .payload = payload,
@@ -272,14 +326,13 @@ const deepl_web = struct {
                 .authorization = .{ .override = "None" },
                 .content_type = .{ .override = "application/json" },
             },
-            .response_writer = &body.writer,
         });
         if (response.status != .ok) {
             std.debug.print("DeepL web request failed: HTTP {d}\n", .{@backingInt(response.status)});
             return statusError(response.status);
         }
 
-        const result = try parseResponse(gpa, body.written());
+        const result = try parseResponse(gpa, response.body);
         try rejectEcho(text, result.text, result.source_lang, target_lang);
         return .{ .text = result.text, .source_lang = result.source_lang, .target_lang = target_lang, .service = .deepl_web };
     }
@@ -463,7 +516,46 @@ test describeError {
     const gpa = arena.allocator();
     try std.testing.expectEqualStrings("No network connection.", try describeError(gpa, error.NetworkUnreachable));
     try std.testing.expectEqualStrings("The text is too long to translate.", try describeError(gpa, error.TextTooLong));
+    try std.testing.expectEqualStrings("The translation service sent an unexpected response.", try describeError(gpa, error.ResponseTooLarge));
     try std.testing.expectEqualStrings("Translation failed (HttpChunkInvalid).", try describeError(gpa, error.HttpChunkInvalid));
+}
+
+test "CappedWriter keeps up to the limit and fails past it" {
+    const gpa = std.testing.allocator;
+    var buffer: [16]u8 = undefined;
+    var exact: CappedWriter = .init(gpa, 100, &buffer);
+    defer exact.out.deinit();
+    try exact.writer.splatByteAll('a', 60);
+    try exact.writer.writeAll(&@as([40]u8, @splat('b')));
+    try exact.writer.flush();
+    try std.testing.expectEqual(100, exact.out.written().len);
+    try std.testing.expect(!exact.too_large);
+
+    var over: CappedWriter = .init(gpa, 100, &buffer);
+    defer over.out.deinit();
+    try over.writer.writeAll(&@as([90]u8, @splat('c')));
+    try std.testing.expectError(error.WriteFailed, over.writer.writeAll(&@as([20]u8, @splat('d'))));
+    try std.testing.expect(over.too_large);
+    try std.testing.expect(over.out.written().len <= 100);
+
+    // A body streamed from a reader, as `fetch` does, stops at the cap.
+    const data = try gpa.alloc(u8, max_response_size + 1);
+    defer gpa.free(data);
+    @memset(data, 'x');
+    var source: Io.Reader = .fixed(data);
+    var big: CappedWriter = .init(gpa, max_response_size, &buffer);
+    defer big.out.deinit();
+    try std.testing.expectError(error.WriteFailed, source.streamRemaining(&big.writer));
+    try std.testing.expect(big.too_large);
+    try std.testing.expect(big.out.written().len <= max_response_size);
+
+    // Exactly at the cap is fine.
+    var at_cap_source: Io.Reader = .fixed(data[0..max_response_size]);
+    var at_cap: CappedWriter = .init(gpa, max_response_size, &buffer);
+    defer at_cap.out.deinit();
+    try std.testing.expectEqual(max_response_size, try at_cap_source.streamRemaining(&at_cap.writer));
+    try at_cap.writer.flush();
+    try std.testing.expectEqual(max_response_size, at_cap.out.written().len);
 }
 
 test "Fallback.of: only a too-long text is told apart" {
@@ -476,5 +568,7 @@ test "deepl_web refuses text over its limit before any request" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const text: [deepl_web.max_text_len + 1]u8 = @splat('a');
-    try std.testing.expectError(error.TextTooLong, deepl_web.translate(arena.allocator(), std.testing.io, &text, "tr"));
+    var client: std.http.Client = .{ .allocator = arena.allocator(), .io = std.testing.io };
+    defer client.deinit();
+    try std.testing.expectError(error.TextTooLong, deepl_web.translate(arena.allocator(), &client, &text, "tr"));
 }

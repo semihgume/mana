@@ -10,6 +10,8 @@ pub const Request = struct {
     problem: ?[]const u8,
     backend: translator.Backend,
     options: translator.Options,
+    /// Target language codes offered in the picker after "Auto", in order.
+    languages: []const []const u8,
 };
 
 const popup_width = 560;
@@ -20,19 +22,28 @@ const drag_threshold = 3;
 /// How long (ms) the popup must stay unfocused before it closes.
 const focus_settle_time = 200;
 
-/// Target languages offered in the header. The first entry is the smart rule.
-const languages = [_]struct { name: [*:0]const u8, code: ?[]const u8 }{
-    .{ .name = "Auto", .code = null },
-    .{ .name = "Türkçe", .code = "tr" },
-    .{ .name = "English", .code = "en" },
-    .{ .name = "Deutsch", .code = "de" },
-    .{ .name = "Français", .code = "fr" },
-    .{ .name = "Español", .code = "es" },
-    .{ .name = "Italiano", .code = "it" },
-    .{ .name = "Русский", .code = "ru" },
-    .{ .name = "العربية", .code = "ar" },
-    .{ .name = "日本語", .code = "ja" },
-    .{ .name = "中文", .code = "zh-CN" },
+/// Display names for language codes in the picker, each in its own language.
+const language_names = [_]struct { code: []const u8, name: [:0]const u8 }{
+    .{ .code = "tr", .name = "Türkçe" },
+    .{ .code = "en", .name = "English" },
+    .{ .code = "de", .name = "Deutsch" },
+    .{ .code = "fr", .name = "Français" },
+    .{ .code = "es", .name = "Español" },
+    .{ .code = "it", .name = "Italiano" },
+    .{ .code = "pt", .name = "Português" },
+    .{ .code = "nl", .name = "Nederlands" },
+    .{ .code = "pl", .name = "Polski" },
+    .{ .code = "sv", .name = "Svenska" },
+    .{ .code = "el", .name = "Ελληνικά" },
+    .{ .code = "ru", .name = "Русский" },
+    .{ .code = "uk", .name = "Українська" },
+    .{ .code = "ar", .name = "العربية" },
+    .{ .code = "fa", .name = "فارسی" },
+    .{ .code = "hi", .name = "हिन्दी" },
+    .{ .code = "ja", .name = "日本語" },
+    .{ .code = "ko", .name = "한국어" },
+    .{ .code = "zh-CN", .name = "中文" },
+    .{ .code = "zh-TW", .name = "繁體中文" },
 };
 
 const css =
@@ -133,7 +144,7 @@ pub fn run(gpa: Allocator, io: Io, request: Request) !noreturn {
     c.gtk_label_set_xalign(direction, 0);
     c.gtk_widget_set_hexpand(widget(direction), 1);
     c.gtk_widget_add_css_class(widget(direction), "direction");
-    const language = newLanguagePicker(request.options.forced_target);
+    const language = try newLanguagePicker(gpa, request.languages, request.options.forced_target);
     const copy_button: *c.GtkButton = @ptrCast(c.gtk_button_new_with_label("Copy"));
     c.gtk_widget_add_css_class(widget(copy_button), "flat");
     c.gtk_widget_set_sensitive(widget(copy_button), 0);
@@ -219,12 +230,18 @@ fn newWrappingLabel(text: [*:0]const u8, css_class: [*:0]const u8) *c.GtkLabel {
     return label;
 }
 
-fn newLanguagePicker(forced_target: ?[]const u8) struct { dropdown: *c.GtkDropDown, list: ?*c.GtkPopover } {
+/// Entry 0 is "Auto" (the smart rule), then one entry per code in `languages`.
+fn newLanguagePicker(
+    gpa: Allocator,
+    languages: []const []const u8,
+    forced_target: ?[]const u8,
+) Allocator.Error!struct { dropdown: *c.GtkDropDown, list: ?*c.GtkPopover } {
     const names = c.gtk_string_list_new(null);
-    for (languages) |language| c.gtk_string_list_append(names, language.name);
+    c.gtk_string_list_append(names, "Auto");
+    for (languages) |code| c.gtk_string_list_append(names, try languageName(gpa, code));
     const dropdown: *c.GtkDropDown = @ptrCast(c.gtk_drop_down_new(@ptrCast(names), null));
     c.gtk_widget_set_tooltip_text(widget(dropdown), "Target language");
-    c.gtk_drop_down_set_selected(dropdown, languageIndex(forced_target));
+    c.gtk_drop_down_set_selected(dropdown, languageIndex(languages, forced_target));
 
     var list: ?*c.GtkPopover = null;
     var child: ?*c.GtkWidget = c.gtk_widget_get_first_child(widget(dropdown));
@@ -243,14 +260,23 @@ fn newLanguagePicker(forced_target: ?[]const u8) struct { dropdown: *c.GtkDropDo
     return .{ .dropdown = dropdown, .list = list };
 }
 
-/// The entry for a `-t` language, or "Auto" when it is not in the list.
-fn languageIndex(code: ?[]const u8) c.guint {
+/// The picker entry for a `-t` language, or "Auto" when it is not in the list.
+fn languageIndex(languages: []const []const u8, code: ?[]const u8) c.guint {
     const wanted = code orelse return 0;
-    for (languages, 0..) |language, i| {
-        const known = language.code orelse continue;
+    for (languages, 1..) |known, i| {
         if (std.ascii.eqlIgnoreCase(known, wanted)) return @intCast(i);
     }
     return 0;
+}
+
+/// The display name for a language code; an unknown code is shown uppercased.
+fn languageName(gpa: Allocator, code: []const u8) Allocator.Error![:0]const u8 {
+    for (language_names) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.code, code)) return entry.name;
+    }
+    const name = try gpa.allocSentinel(u8, code.len, 0);
+    _ = std.ascii.upperString(name, code);
+    return name;
 }
 
 /// Starts translating the original text into `target` (`null`: smart rule).
@@ -285,8 +311,14 @@ fn translate(job: *Job) !Outcome {
     const result = try translator.translateSmart(popup.request.backend, gpa, popup.io, popup.request.text, options);
     const source = try std.ascii.allocUpperString(gpa, result.source_lang);
     const target = try std.ascii.allocUpperString(gpa, result.target_lang);
+    const service: []const u8 = if (result.fell_back)
+        " · Google (DeepL failed)"
+    else switch (result.service) {
+        .google => "",
+        .deepl => " · DeepL",
+    };
     return .{ .translated = .{
-        .direction = try gpa.printSentinel("{s} → {s}", .{ source, target }, 0),
+        .direction = try gpa.printSentinel("{s} → {s}{s}", .{ source, target, service }, 0),
         .text = try gpa.dupeSentinel(u8, result.text, 0),
     } };
 }
@@ -321,7 +353,12 @@ fn showError(popup: *Popup, message: [*:0]const u8) void {
 fn onLanguageSelected(_: *c.GObject, _: *c.GParamSpec, data: c.gpointer) callconv(.c) void {
     const popup: *Popup = @ptrCast(@alignCast(data));
     const index = c.gtk_drop_down_get_selected(popup.language);
-    if (index < languages.len) translateTo(popup, languages[index].code);
+    const languages = popup.request.languages;
+    if (index == 0) {
+        translateTo(popup, null);
+    } else if (index <= languages.len) {
+        translateTo(popup, languages[index - 1]);
+    }
 }
 
 fn onLanguageListMapped(list: *c.GtkWidget, _: c.gpointer) callconv(.c) void {
@@ -517,8 +554,18 @@ fn connect(instance: anytype, signal: [*:0]const u8, handler: anytype, popup: *P
 }
 
 test languageIndex {
-    try std.testing.expectEqual(0, languageIndex(null));
-    try std.testing.expectEqual(3, languageIndex("de"));
-    try std.testing.expectEqual(10, languageIndex("zh-cn"));
-    try std.testing.expectEqual(0, languageIndex("xx"));
+    const languages: []const []const u8 = &.{ "tr", "en", "de", "zh-CN" };
+    try std.testing.expectEqual(0, languageIndex(languages, null));
+    try std.testing.expectEqual(3, languageIndex(languages, "de"));
+    try std.testing.expectEqual(4, languageIndex(languages, "zh-cn"));
+    try std.testing.expectEqual(0, languageIndex(languages, "xx"));
+}
+
+test languageName {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    try std.testing.expectEqualStrings("Deutsch", try languageName(gpa, "de"));
+    try std.testing.expectEqualStrings("繁體中文", try languageName(gpa, "ZH-tw"));
+    try std.testing.expectEqualStrings("XX-YY", try languageName(gpa, "xx-yy"));
 }

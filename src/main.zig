@@ -1,11 +1,9 @@
 const std = @import("std");
 const Io = std.Io;
+const config = @import("config.zig");
 const selection = @import("selection.zig");
 const translator = @import("translator.zig");
 const ui = @import("ui.zig");
-
-const primary_lang = "tr";
-const secondary_lang = "en";
 
 const usage =
     \\Usage: mana [--print] [-t LANG] [TEXT...]
@@ -16,15 +14,19 @@ const usage =
     \\  --print   Print the translation to stdout instead of showing a popup.
     \\  -t LANG   Always translate into LANG.
     \\
+    \\Settings are read from ~/.config/mana/config.
+    \\
 ;
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
 
+    const settings = try config.load(arena, io, init.environ_map);
+
     const args = try init.minimal.args.toSlice(arena);
     var print_mode = false;
-    var options: translator.Options = .{ .primary_lang = primary_lang, .secondary_lang = secondary_lang };
+    var options: translator.Options = .{ .primary_lang = settings.native, .secondary_lang = settings.fallback };
     var words: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -52,13 +54,20 @@ pub fn main(init: std.process.Init) !void {
         };
     if (problem == null and text.len == 0) problem = "No text selected.";
 
-    const backend: translator.Backend = .google;
+    const backend: translator.Backend = switch (settings.backend) {
+        .google => .google,
+        .deepl => if (settings.deepl_key) |key| .{ .deepl = .{ .key = key } } else blk: {
+            std.debug.print("mana: config: backend = deepl needs deepl_key; using Google\n", .{});
+            break :blk .google;
+        },
+    };
 
     if (!print_mode) try ui.run(arena, io, .{
         .text = text,
         .problem = problem,
         .backend = backend,
         .options = options,
+        .languages = settings.languages,
     });
 
     if (problem) |message| {
@@ -71,11 +80,18 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
-    try stdout.print("[{s} -> {s}]\n{s}\n", .{ result.source_lang, result.target_lang, result.text });
+    const service: []const u8 = if (result.fell_back)
+        ", Google: DeepL failed"
+    else switch (result.service) {
+        .google => "",
+        .deepl => ", DeepL",
+    };
+    try stdout.print("[{s} -> {s}{s}]\n{s}\n", .{ result.source_lang, result.target_lang, service, result.text });
     try stdout.flush();
 }
 
 test {
+    _ = config;
     _ = translator;
     _ = ui;
 }

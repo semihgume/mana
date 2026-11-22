@@ -78,8 +78,15 @@ pub fn parse(arena: Allocator, text: []const u8, warnings: *std.ArrayList([]cons
 /// Reads and parses the config file. A missing file silently yields defaults.
 /// Any other read problem and every parse warning is printed to stderr with
 /// std.debug.print prefixed "mana: config: ", and defaults/partial config are
-/// returned. Never returns an error to the caller except OutOfMemory.
-pub fn load(arena: Allocator, io: Io, environ: *const std.process.Environ.Map) Allocator.Error!Config {
+/// returned. The same problems are appended to `problems` as short messages
+/// without the file's path, for the popup. Never returns an error to the
+/// caller except OutOfMemory.
+pub fn load(
+    arena: Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    problems: *std.ArrayList([]const u8),
+) Allocator.Error!Config {
     const xdg = environ.get("XDG_CONFIG_HOME") orelse "";
     const config_path = if (xdg.len > 0)
         try std.fs.path.join(arena, &.{ xdg, "mana", "config" })
@@ -87,6 +94,7 @@ pub fn load(arena: Allocator, io: Io, environ: *const std.process.Environ.Map) A
         try std.fs.path.join(arena, &.{ home, ".config", "mana", "config" })
     else {
         std.debug.print("mana: config: neither XDG_CONFIG_HOME nor HOME is set\n", .{});
+        try problems.append(arena, "neither XDG_CONFIG_HOME nor HOME is set");
         return .{};
     };
 
@@ -95,13 +103,14 @@ pub fn load(arena: Allocator, io: Io, environ: *const std.process.Environ.Map) A
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             std.debug.print("mana: config: cannot read {s}: {t}\n", .{ config_path, err });
+            try problems.append(arena, try arena.print("cannot read the file ({t})", .{err}));
             return .{};
         },
     };
 
-    var warnings: std.ArrayList([]const u8) = .empty;
-    const config = try parse(arena, text, &warnings);
-    for (warnings.items) |warning| std.debug.print("mana: config: {s}: {s}\n", .{ config_path, warning });
+    const first = problems.items.len;
+    const config = try parse(arena, text, problems);
+    for (problems.items[first..]) |warning| std.debug.print("mana: config: {s}: {s}\n", .{ config_path, warning });
     return config;
 }
 
@@ -213,6 +222,8 @@ test "load: missing file gives defaults" {
     var environ: std.process.Environ.Map = .init(testing.allocator);
     defer environ.deinit();
     try environ.put("XDG_CONFIG_HOME", "/nonexistent/mana-test");
-    const config = try load(arena.allocator(), testing.io, &environ);
+    var problems: std.ArrayList([]const u8) = .empty;
+    const config = try load(arena.allocator(), testing.io, &environ, &problems);
     try testing.expectEqualStrings("tr", config.native);
+    try testing.expectEqual(0, problems.items.len);
 }

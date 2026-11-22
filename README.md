@@ -157,6 +157,7 @@ mana [--print] [-t LANG] [TEXT...]
 | `mana --print "Good morning"` | Print the translation to the terminal, no popup |
 | `mana -t de "Good morning"` | Translate into German regardless of the automatic direction |
 | `mana --help` | Show the usage text |
+| `mana --version` | Show the version (`-V` for short) |
 
 `--print` writes the direction on the first line and the translation after it, and exits with status 1 when the translation fails.
 
@@ -189,7 +190,7 @@ languages = de, en, fr, es, pt
 
 Languages are written as two-letter codes such as `en`, `de`, `fr`, `tr`; Chinese is `zh-CN` (simplified) or `zh-TW` (traditional). The dropdown shows a name for the common ones and the code itself for the rest.
 
-A line mana cannot understand (an unknown key, a missing `=`, an unknown backend) is skipped and reported on standard error; the default for that setting stays in place. To see such messages, run mana from a terminal:
+A line mana cannot understand (an unknown key, a missing `=`, an unknown backend) is skipped and the default for that setting stays in place. The problem is shown as a dim `Config:` line at the bottom of the popup and printed on standard error with the file's path. To see all messages, run mana from a terminal:
 
 ```sh
 mana --print "Hello"
@@ -255,8 +256,8 @@ Run mana from a terminal to see its messages: `mana --print "Hello"` for the tra
 | The popup says "The selection is not text." | The clipboard holds an image or other data. |
 | The popup opens as an ordinary window | The compositor does not support layer-shell (GNOME, for example). mana prints a warning and falls back to a normal window. |
 | The header reads `Google (DeepL failed)` | The DeepL request failed; the terminal output shows the HTTP status. 403 means a wrong key, 456 means the quota is used up, 429 means too many requests. |
-| "No network connection." or "The translation service did not answer in time." | The service could not be reached. The popup gives up after 15 seconds. |
-| My settings are ignored | Check the file's path and spelling by running `mana --print "Hello"`; problems in the config file are printed there. |
+| "No network connection." or "The translation service did not answer in time." | The service could not be reached. The popup and `--print` give up after 15 seconds. |
+| My settings are ignored | If the file has problems, the popup shows the first one at the bottom (`Config: ...`, with `(+N more)` for the rest). Run `mana --print "Hello"` to see all of them with the file's path; if nothing is printed, check that the file is at the path given under [Configuration](#configuration). |
 | The popup closes by itself | It closes when it loses keyboard focus, for example when another window takes focus. |
 | The popup opens in an odd place | Delete `~/.local/state/mana/position`. |
 | Copy does nothing, or the button says "Copy failed" | `wl-copy` is missing. Install wl-clipboard. |

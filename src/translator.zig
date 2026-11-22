@@ -4,6 +4,11 @@ const Allocator = std.mem.Allocator;
 
 pub const Service = enum { google, deepl, deepl_web };
 
+/// Seconds after which a translation that has not come back is given up on,
+/// in the popup and with `--print`. The http client has no timeout, so this
+/// catches a stalled network.
+pub const request_timeout = 15;
+
 pub const Translation = struct {
     text: []const u8,
     source_lang: []const u8,

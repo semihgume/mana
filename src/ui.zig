@@ -15,6 +15,8 @@ pub const Request = struct {
     languages: []const []const u8,
     /// Where a dragged position is remembered; `null`: nowhere.
     position_path: ?[]const u8,
+    /// Problems with the config file, shown as a notice below the translation.
+    config_problems: []const []const u8,
 };
 
 const popup_width = 560;
@@ -26,9 +28,6 @@ const top_margin = 80;
 const drag_threshold = 3;
 /// How long (ms) the popup must stay unfocused before it closes.
 const focus_settle_time = 200;
-/// Seconds after which a translation that has not come back is given up on.
-/// The http client has no timeout, so this catches a stalled network.
-const request_timeout = 15;
 
 /// Display names for language codes in the picker, each in its own language.
 const language_names = [_]struct { code: []const u8, name: [:0]const u8 }{
@@ -68,6 +67,7 @@ const css =
     \\.direction { font-weight: bold; font-size: 0.85em; opacity: 0.7; }
     \\.original { opacity: 0.55; }
     \\.translation { font-size: 1.15em; }
+    \\.notice { font-size: 0.85em; opacity: 0.45; }
     \\.error { color: @error_color; }
 ;
 
@@ -189,6 +189,12 @@ pub fn run(gpa: Allocator, io: Io, request: Request) !noreturn {
     c.gtk_scrolled_window_set_child(@ptrCast(scroller), widget(translation));
     c.gtk_box_append(@ptrCast(card), scroller);
 
+    // Started from a shortcut nobody sees stderr, so config problems show here.
+    if (request.config_problems.len > 0) {
+        const notice = newWrappingLabel(try noticeText(gpa, request.config_problems), "notice");
+        c.gtk_box_append(@ptrCast(card), widget(notice));
+    }
+
     const popup = try gpa.create(Popup);
     popup.* = .{
         .gpa = gpa,
@@ -255,6 +261,12 @@ fn previewText(gpa: Allocator, text: []const u8) Allocator.Error![:0]const u8 {
         try out.appendSlice(gpa, word);
     }
     return out.toOwnedSliceSentinel(gpa, 0);
+}
+
+/// The notice line for config problems: the first one, and how many more.
+fn noticeText(gpa: Allocator, problems: []const []const u8) Allocator.Error![:0]const u8 {
+    if (problems.len == 1) return gpa.printSentinel("Config: {s}", .{problems[0]}, 0);
+    return gpa.printSentinel("Config: {s} (+{d} more)", .{ problems[0], problems.len - 1 }, 0);
 }
 
 fn newWrappingLabel(text: [*:0]const u8, css_class: [*:0]const u8) *c.GtkLabel {
@@ -333,7 +345,7 @@ fn translateTo(popup: *Popup, target: ?[]const u8) void {
         return showError(popup, translator.describeError(popup.gpa, err) catch "Translation failed.");
     };
     thread.detach();
-    _ = c.g_timeout_add_seconds(request_timeout, onTimeout, job);
+    _ = c.g_timeout_add_seconds(translator.request_timeout, onTimeout, job);
 }
 
 fn work(job: *Job) void {
@@ -744,4 +756,18 @@ test previewText {
     try std.testing.expectEqualStrings("a b", try previewText(gpa, "\ta\x0cb "));
     try std.testing.expectEqualStrings("Merhaba dünya", try previewText(gpa, "Merhaba dünya"));
     try std.testing.expectEqualStrings("", try previewText(gpa, " \n "));
+}
+
+test noticeText {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    try std.testing.expectEqualStrings(
+        "Config: line 3: unknown key \"colour\"",
+        try noticeText(gpa, &.{"line 3: unknown key \"colour\""}),
+    );
+    try std.testing.expectEqualStrings(
+        "Config: line 1: expected `key = value` (+2 more)",
+        try noticeText(gpa, &.{ "line 1: expected `key = value`", "line 2: unknown backend \"bing\"", "backend = deepl needs deepl_key; using Google" }),
+    );
 }

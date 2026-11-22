@@ -29,13 +29,20 @@ pub fn build(b: *std.Build) void {
     const c_module = c.createModule();
     c_module.addCSourceFile(.{ .file = protocol_code });
 
+    // build.zig.zon is the single source of the version; `--version` prints it.
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", @import("build.zig.zon").version);
+
     const exe = b.addExecutable(.{
         .name = "mana",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "c", .module = c_module }},
+            .imports = &.{
+                .{ .name = "c", .module = c_module },
+                .{ .name = "build_options", .module = options.createModule() },
+            },
         }),
     });
     b.installArtifact(exe);

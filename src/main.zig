@@ -5,6 +5,7 @@ const selection = @import("selection.zig");
 const state = @import("state.zig");
 const translator = @import("translator.zig");
 const ui = @import("ui.zig");
+const build_options = @import("build_options");
 
 const usage =
     \\Usage: mana [--print] [-t LANG] [TEXT...]
@@ -12,8 +13,9 @@ const usage =
     \\Translates TEXT, or the current selection when no TEXT is given, and
     \\shows the result in a popup.
     \\
-    \\  --print   Print the translation to stdout instead of showing a popup.
-    \\  -t LANG   Always translate into LANG.
+    \\  --print         Print the translation to stdout instead of showing a popup.
+    \\  -t LANG         Always translate into LANG.
+    \\  -V, --version   Print the version and exit.
     \\
     \\Settings are read from ~/.config/mana/config.
     \\
@@ -23,11 +25,9 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
 
-    const settings = try config.load(arena, io, init.environ_map);
-
     const args = try init.minimal.args.toSlice(arena);
     var print_mode = false;
-    var options: translator.Options = .{ .primary_lang = settings.native, .secondary_lang = settings.fallback };
+    var forced_target: ?[]const u8 = null;
     var words: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -36,14 +36,25 @@ pub fn main(init: std.process.Init) !void {
             print_mode = true;
         } else if (std.mem.eql(u8, arg, "-t") and i + 1 < args.len) {
             i += 1;
-            options.forced_target = args[i];
+            forced_target = args[i];
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             std.debug.print("{s}", .{usage});
+            return;
+        } else if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
+            try printStdout(io, "mana {s}\n", .{build_options.version});
             return;
         } else {
             try words.append(arena, arg);
         }
     }
+
+    var config_problems: std.ArrayList([]const u8) = .empty;
+    const settings = try config.load(arena, io, init.environ_map, &config_problems);
+    const options: translator.Options = .{
+        .primary_lang = settings.native,
+        .secondary_lang = settings.fallback,
+        .forced_target = forced_target,
+    };
 
     var problem: ?[]const u8 = null;
     const text = if (words.items.len > 0)
@@ -63,7 +74,9 @@ pub fn main(init: std.process.Init) !void {
     const backend: translator.Backend = switch (settings.backend) {
         .google => .google,
         .deepl => if (settings.deepl_key) |key| .{ .deepl = .{ .key = key } } else blk: {
-            std.debug.print("mana: config: backend = deepl needs deepl_key; using Google\n", .{});
+            const message = "backend = deepl needs deepl_key; using Google";
+            std.debug.print("mana: config: {s}\n", .{message});
+            try config_problems.append(arena, message);
             break :blk .google;
         },
         .deepl_web => .deepl_web,
@@ -76,6 +89,7 @@ pub fn main(init: std.process.Init) !void {
         .options = options,
         .languages = settings.languages,
         .position_path = try state.positionPath(arena, init.environ_map),
+        .config_problems = config_problems.items,
     });
 
     if (problem) |message| {
@@ -83,16 +97,49 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
-    const result = translator.translateSmart(backend, arena, io, text, options) catch |err| {
+    // The http client has no timeout and cancelling a request is unreliable,
+    // so translate on a worker and stop waiting for it after the timeout.
+    var job: PrintJob = .{ .backend = backend, .arena = arena, .io = io, .text = text, .options = options };
+    const worker = try std.Thread.spawn(.{}, PrintJob.work, .{&job});
+    const timeout: Io.Clock.Duration = .{ .raw = .fromSeconds(translator.request_timeout), .clock = .awake };
+    job.done.waitTimeout(io, .{ .deadline = .fromNow(io, timeout) }) catch |err| switch (err) {
+        error.Timeout => {
+            std.debug.print("{s}\n", .{try translator.describeError(arena, error.TimedOut)});
+            // The worker still uses `io` and `arena`: exit instead of returning.
+            std.process.exit(1);
+        },
+        error.Canceled => |e| return e,
+    };
+    worker.join();
+
+    const result = job.result catch |err| {
         std.debug.print("{s}\n", .{try translator.describeError(arena, err)});
         std.process.exit(1);
     };
+    try printStdout(io, "[{s} -> {s}{s}]\n{s}\n", .{ result.source_lang, result.target_lang, serviceLabel(result), result.text });
+}
 
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout = &stdout_file_writer.interface;
-    try stdout.print("[{s} -> {s}{s}]\n{s}\n", .{ result.source_lang, result.target_lang, serviceLabel(result), result.text });
-    try stdout.flush();
+/// The `--print` translation, run on a worker thread so `main` can give up on it.
+const PrintJob = struct {
+    backend: translator.Backend,
+    arena: std.mem.Allocator,
+    io: Io,
+    text: []const u8,
+    options: translator.Options,
+    result: anyerror!translator.Translation = undefined,
+    done: Io.Event = .unset,
+
+    fn work(job: *PrintJob) void {
+        job.result = translator.translateSmart(job.backend, job.arena, job.io, job.text, job.options);
+        job.done.set(job.io);
+    }
+};
+
+fn printStdout(io: Io, comptime format: []const u8, args: anytype) !void {
+    var buffer: [4096]u8 = undefined;
+    var file_writer: Io.File.Writer = .init(.stdout(), io, &buffer);
+    try file_writer.interface.print(format, args);
+    try file_writer.interface.flush();
 }
 
 /// The part of the `--print` header that names the service.

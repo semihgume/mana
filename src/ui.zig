@@ -3,6 +3,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const c = @import("c");
 const translator = @import("translator.zig");
+const state = @import("state.zig");
 
 pub const Request = struct {
     text: []const u8,
@@ -12,15 +13,22 @@ pub const Request = struct {
     options: translator.Options,
     /// Target language codes offered in the picker after "Auto", in order.
     languages: []const []const u8,
+    /// Where a dragged position is remembered; `null`: nowhere.
+    position_path: ?[]const u8,
 };
 
 const popup_width = 560;
 const max_translation_height = 360;
+/// The least the translation keeps on a monitor too small for the full height.
+const min_translation_height = 48;
 const top_margin = 80;
 /// Pointer travel in pixels after which a press on the header becomes a drag.
 const drag_threshold = 3;
 /// How long (ms) the popup must stay unfocused before it closes.
 const focus_settle_time = 200;
+/// Seconds after which a translation that has not come back is given up on.
+/// The http client has no timeout, so this catches a stalled network.
+const request_timeout = 15;
 
 /// Display names for language codes in the picker, each in its own language.
 const language_names = [_]struct { code: []const u8, name: [:0]const u8 }{
@@ -71,6 +79,7 @@ const Popup = struct {
     window: *c.GtkWindow,
     direction: *c.GtkLabel,
     translation: *c.GtkLabel,
+    scroller: *c.GtkScrolledWindow,
     copy_button: *c.GtkButton,
     language: *c.GtkDropDown,
     /// The dropdown's list. GtkDropDown has no getter; it is a child widget.
@@ -86,6 +95,8 @@ const Popup = struct {
     /// Layer-shell margins (left, top) the incoming pointer events are
     /// relative to: the ones of the last committed frame.
     drag_base: [2]c_int = .{ 0, 0 },
+    /// Window size `keepOnScreen` last checked; any other size is re-checked.
+    checked_size: [2]c_int = .{ 0, 0 },
 };
 
 /// One translation request. Never freed (the process is short-lived), so a
@@ -97,6 +108,8 @@ const Job = struct {
     target: ?[]const u8,
     /// Written by the worker thread before it schedules `onResult`.
     outcome: Outcome = undefined,
+    /// Set on the main thread once `onResult` has run.
+    done: bool = false,
 };
 
 const Outcome = union(enum) {
@@ -126,6 +139,14 @@ pub fn run(gpa: Allocator, io: Io, request: Request) !noreturn {
         c.gtk_layer_set_layer(window, c.GTK_LAYER_SHELL_LAYER_OVERLAY);
         c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_TOP, 1);
         c.gtk_layer_set_margin(window, c.GTK_LAYER_SHELL_EDGE_TOP, top_margin);
+        // Where the last drag left it, anchored by the top-left corner as a
+        // drag does (`beginMove`). Brought on screen once its monitor and
+        // size are known (`keepOnScreen`).
+        if (request.position_path) |path| if (state.loadPosition(io, path)) |position| {
+            c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_LEFT, 1);
+            c.gtk_layer_set_margin(window, c.GTK_LAYER_SHELL_EDGE_LEFT, position[0]);
+            c.gtk_layer_set_margin(window, c.GTK_LAYER_SHELL_EDGE_TOP, position[1]);
+        };
         // Position against the whole monitor rather than the area panels
         // leave free, so drag margins match the monitor geometry.
         c.gtk_layer_set_exclusive_zone(window, -1);
@@ -153,9 +174,11 @@ pub fn run(gpa: Allocator, io: Io, request: Request) !noreturn {
     c.gtk_box_append(@ptrCast(header), widget(copy_button));
     c.gtk_box_append(@ptrCast(card), header);
 
-    const original = newWrappingLabel(try gpa.dupeSentinel(u8, request.text, 0), "original");
+    const original = newWrappingLabel(try previewText(gpa, request.text), "original");
     c.gtk_label_set_lines(original, 3);
     c.gtk_label_set_ellipsize(original, c.PANGO_ELLIPSIZE_END);
+    // Empty when nothing was selected; an empty label still takes a line.
+    c.gtk_widget_set_visible(widget(original), @intFromBool(request.text.len > 0));
     c.gtk_box_append(@ptrCast(card), widget(original));
 
     const translation = newWrappingLabel("Translating…", "translation");
@@ -175,6 +198,7 @@ pub fn run(gpa: Allocator, io: Io, request: Request) !noreturn {
         .window = window,
         .direction = direction,
         .translation = translation,
+        .scroller = @ptrCast(scroller),
         .copy_button = copy_button,
         .language = language.dropdown,
         .language_list = language.list,
@@ -203,9 +227,12 @@ pub fn run(gpa: Allocator, io: Io, request: Request) !noreturn {
     c.gtk_window_set_focus(window, null);
     // Needs the realized window, which `present` gives us.
     connect(c.gtk_widget_get_frame_clock(widget(window)), "after-paint", &onAfterPaint, popup);
+    connect(c.gtk_native_get_surface(@ptrCast(window)), "enter-monitor", &onEnterMonitor, popup);
 
     if (request.problem) |message| {
-        c.gtk_widget_set_sensitive(widget(language.dropdown), 0);
+        // Nothing to translate or copy: only the message and Esc remain.
+        c.gtk_widget_set_visible(widget(language.dropdown), 0);
+        c.gtk_widget_set_visible(widget(copy_button), 0);
         showError(popup, try gpa.dupeSentinel(u8, message, 0));
     } else {
         translateTo(popup, request.options.forced_target);
@@ -216,6 +243,18 @@ pub fn run(gpa: Allocator, io: Io, request: Request) !noreturn {
     // Workers may still be blocked on the network; exit right away instead
     // of tearing down the allocator and Io they are using.
     std.process.exit(0);
+}
+
+/// The original text as one paragraph. `gtk_label_set_lines` limits the lines
+/// of each paragraph (Pango), so with line breaks the preview grew unbounded.
+fn previewText(gpa: Allocator, text: []const u8) Allocator.Error![:0]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var words = std.mem.tokenizeAny(u8, text, " \t\r\n\x0b\x0c");
+    while (words.next()) |word| {
+        if (out.items.len > 0) try out.append(gpa, ' ');
+        try out.appendSlice(gpa, word);
+    }
+    return out.toOwnedSliceSentinel(gpa, 0);
 }
 
 fn newWrappingLabel(text: [*:0]const u8, css_class: [*:0]const u8) *c.GtkLabel {
@@ -288,17 +327,18 @@ fn translateTo(popup: *Popup, target: ?[]const u8) void {
     c.gtk_button_set_label(popup.copy_button, "Copy");
     c.gtk_widget_set_sensitive(widget(popup.copy_button), 0);
 
-    const job = popup.gpa.create(Job) catch return showError(popup, "Translation failed: OutOfMemory");
+    const job = popup.gpa.create(Job) catch return showError(popup, "Translation failed (OutOfMemory).");
     job.* = .{ .popup = popup, .generation = popup.generation, .target = target };
     const thread = std.Thread.spawn(.{}, work, .{job}) catch |err| {
-        return showError(popup, popup.gpa.printSentinel("Translation failed: {t}", .{err}, 0) catch "Translation failed.");
+        return showError(popup, translator.describeError(popup.gpa, err) catch "Translation failed.");
     };
     thread.detach();
+    _ = c.g_timeout_add_seconds(request_timeout, onTimeout, job);
 }
 
 fn work(job: *Job) void {
     job.outcome = translate(job) catch |err| .{
-        .failed = job.popup.gpa.printSentinel("Translation failed: {t}", .{err}, 0) catch "Translation failed.",
+        .failed = translator.describeError(job.popup.gpa, err) catch "Translation failed.",
     };
     _ = c.g_idle_add(onResult, job);
 }
@@ -311,23 +351,30 @@ fn translate(job: *Job) !Outcome {
     const result = try translator.translateSmart(popup.request.backend, gpa, popup.io, popup.request.text, options);
     const source = try std.ascii.allocUpperString(gpa, result.source_lang);
     const target = try std.ascii.allocUpperString(gpa, result.target_lang);
-    const service: []const u8 = if (result.fell_back)
-        " · Google (DeepL failed)"
-    else switch (result.service) {
+    return .{ .translated = .{
+        .direction = try gpa.printSentinel("{s} → {s}{s}", .{ source, target, serviceLabel(result) }, 0),
+        .text = try gpa.dupeSentinel(u8, result.text, 0),
+    } };
+}
+
+/// The part of the header that names the service.
+fn serviceLabel(result: translator.Translation) []const u8 {
+    if (result.fell_back) |reason| return switch (reason) {
+        .deepl_failed => " · Google (DeepL failed)",
+        .too_long => " · Google (too long for DeepL)",
+    };
+    return switch (result.service) {
         .google => "",
         .deepl => " · DeepL",
         .deepl_web => " · DeepL web",
     };
-    return .{ .translated = .{
-        .direction = try gpa.printSentinel("{s} → {s}{s}", .{ source, target, service }, 0),
-        .text = try gpa.dupeSentinel(u8, result.text, 0),
-    } };
 }
 
 fn onResult(data: c.gpointer) callconv(.c) c.gboolean {
     const job: *Job = @ptrCast(@alignCast(data));
     const popup = job.popup;
-    // Superseded by a later language choice; that request will report.
+    job.done = true;
+    // Superseded by a later language choice, or timed out.
     if (job.generation != popup.generation) return c.G_SOURCE_REMOVE;
     switch (job.outcome) {
         .translated => |t| {
@@ -346,7 +393,22 @@ fn onResult(data: c.gpointer) callconv(.c) c.gboolean {
     return c.G_SOURCE_REMOVE;
 }
 
+/// Gives up on a request that is still running. Its worker stays blocked
+/// until the network answers or the process exits; the result is dropped.
+fn onTimeout(data: c.gpointer) callconv(.c) c.gboolean {
+    const job: *Job = @ptrCast(@alignCast(data));
+    const popup = job.popup;
+    if (!job.done and job.generation == popup.generation) {
+        popup.generation +%= 1;
+        showError(popup, translator.describeError(popup.gpa, error.TimedOut) catch "Translation failed.");
+        c.gtk_window_set_default_size(popup.window, -1, -1);
+    }
+    return c.G_SOURCE_REMOVE;
+}
+
 fn showError(popup: *Popup, message: [*:0]const u8) void {
+    // The direction of an earlier translation no longer applies.
+    c.gtk_label_set_text(popup.direction, "Translate");
     c.gtk_label_set_text(popup.translation, message);
     c.gtk_widget_add_css_class(widget(popup.translation), "error");
 }
@@ -376,7 +438,7 @@ fn onKeyPressed(
     _: *c.GtkEventControllerKey,
     keyval: c.guint,
     _: c.guint,
-    state: c.GdkModifierType,
+    modifiers: c.GdkModifierType,
     data: c.gpointer,
 ) callconv(.c) c.gboolean {
     const popup: *Popup = @ptrCast(@alignCast(data));
@@ -388,7 +450,7 @@ fn onKeyPressed(
         }
         return 1;
     }
-    if (state & c.GDK_CONTROL_MASK != 0 and (keyval == c.GDK_KEY_c or keyval == c.GDK_KEY_C)) {
+    if (modifiers & c.GDK_CONTROL_MASK != 0 and (keyval == c.GDK_KEY_c or keyval == c.GDK_KEY_C)) {
         copy(popup);
         return 1;
     }
@@ -458,12 +520,61 @@ fn onDragUpdate(gesture: *c.GtkGestureDrag, dx: f64, dy: f64, data: c.gpointer) 
 
 fn onDragEnd(_: *c.GtkGestureDrag, _: f64, _: f64, data: c.gpointer) callconv(.c) void {
     const popup: *Popup = @ptrCast(@alignCast(data));
+    // A press that never passed `drag_threshold` did not move anything.
+    if (!popup.dragging) return;
     popup.dragging = false;
+    if (popup.request.position_path) |path| state.savePosition(popup.io, path, margins(popup.window));
 }
 
+/// Runs after every frame. While dragging it advances `drag_base`; otherwise
+/// it notices a new window size (the resize after `set_default_size(-1, -1)`
+/// lands in some later frame) and pulls an overflowing popup back on screen.
 fn onAfterPaint(_: *c.GdkFrameClock, data: c.gpointer) callconv(.c) void {
     const popup: *Popup = @ptrCast(@alignCast(data));
-    if (popup.dragging) popup.drag_base = margins(popup.window);
+    if (popup.dragging) {
+        popup.drag_base = margins(popup.window);
+        return;
+    }
+    const size = windowSize(popup.window);
+    if (std.mem.eql(c_int, &size, &popup.checked_size)) return;
+    // No monitor yet: try again next frame, or on `enter-monitor`.
+    const area = monitorArea(popup.window) orelse return;
+    popup.checked_size = size;
+    keepOnScreen(popup, area);
+}
+
+/// The monitor is known only once the compositor has shown the surface on it.
+fn onEnterMonitor(_: *c.GdkSurface, monitor: *c.GdkMonitor, data: c.gpointer) callconv(.c) void {
+    const popup: *Popup = @ptrCast(@alignCast(data));
+    if (popup.dragging) return;
+    var area: c.GdkRectangle = undefined;
+    c.gdk_monitor_get_geometry(monitor, &area);
+    popup.checked_size = windowSize(popup.window);
+    keepOnScreen(popup, area);
+}
+
+/// Caps the translation's height so the popup fits on the monitor below the
+/// default top margin, then moves the popup up or left just enough to be
+/// fully inside `area`.
+fn keepOnScreen(popup: *Popup, area: c.GdkRectangle) void {
+    const window = popup.window;
+    if (c.gtk_layer_is_layer_window(window) == 0) return;
+    var size = windowSize(window);
+    const shown = c.gtk_widget_get_height(widget(popup.scroller));
+    const cap = translationCap(area.height, size[1] - shown);
+    if (cap != c.gtk_scrolled_window_get_max_content_height(popup.scroller)) {
+        c.gtk_scrolled_window_set_max_content_height(popup.scroller, cap);
+        c.gtk_window_set_default_size(window, -1, -1);
+    }
+    // Place it for the height it is about to shrink to, if any.
+    size[1] -= @max(0, shown - cap);
+    const current = margins(window);
+    const wanted = clampPosition(current, size, .{ area.width, area.height });
+    if (std.mem.eql(c_int, &current, &wanted)) return;
+    // Centered (not left-anchored) popups ignore the left margin; it stays 0.
+    c.gtk_layer_set_margin(window, c.GTK_LAYER_SHELL_EDGE_LEFT, wanted[0]);
+    c.gtk_layer_set_margin(window, c.GTK_LAYER_SHELL_EDGE_TOP, wanted[1]);
+    c.gtk_widget_queue_draw(widget(window));
 }
 
 /// Switches from horizontal centering to left anchoring without moving.
@@ -485,10 +596,13 @@ fn moveBy(popup: *Popup, dx: c_int, dy: c_int) void {
     const window = popup.window;
     if (c.gtk_layer_get_anchor(window, c.GTK_LAYER_SHELL_EDGE_LEFT) == 0) return;
     const area = monitorArea(window) orelse return;
-    const max_left = @max(0, area.width - c.gtk_widget_get_width(widget(window)));
-    const max_top = @max(0, area.height - c.gtk_widget_get_height(widget(window)));
-    c.gtk_layer_set_margin(window, c.GTK_LAYER_SHELL_EDGE_LEFT, std.math.clamp(popup.drag_base[0] + dx, 0, max_left));
-    c.gtk_layer_set_margin(window, c.GTK_LAYER_SHELL_EDGE_TOP, std.math.clamp(popup.drag_base[1] + dy, 0, max_top));
+    const position = clampPosition(
+        .{ popup.drag_base[0] + dx, popup.drag_base[1] + dy },
+        windowSize(window),
+        .{ area.width, area.height },
+    );
+    c.gtk_layer_set_margin(window, c.GTK_LAYER_SHELL_EDGE_LEFT, position[0]);
+    c.gtk_layer_set_margin(window, c.GTK_LAYER_SHELL_EDGE_TOP, position[1]);
     // Make sure this frame paints (and commits), so `onAfterPaint` runs.
     c.gtk_widget_queue_draw(widget(window));
 }
@@ -498,6 +612,25 @@ fn margins(window: *c.GtkWindow) [2]c_int {
         c.gtk_layer_get_margin(window, c.GTK_LAYER_SHELL_EDGE_LEFT),
         c.gtk_layer_get_margin(window, c.GTK_LAYER_SHELL_EDGE_TOP),
     };
+}
+
+/// The most the translation may take on a monitor `area_height` tall when the
+/// rest of the popup takes `others`: the popup ends at the monitor's bottom
+/// when it starts at the default top margin.
+fn translationCap(area_height: c_int, others: c_int) c_int {
+    return std.math.clamp(area_height - top_margin - others, min_translation_height, max_translation_height);
+}
+
+/// Clamps a top-left `position` so a window of `size` lies fully inside a
+/// monitor of `area` (both width, height). Too big a window sits at 0.
+fn clampPosition(position: [2]c_int, size: [2]c_int, area: [2]c_int) [2]c_int {
+    var result: [2]c_int = undefined;
+    for (&result, position, size, area) |*r, p, s, a| r.* = std.math.clamp(p, 0, @max(0, a - s));
+    return result;
+}
+
+fn windowSize(window: *c.GtkWindow) [2]c_int {
+    return .{ c.gtk_widget_get_width(widget(window)), c.gtk_widget_get_height(widget(window)) };
 }
 
 fn monitorArea(window: *c.GtkWindow) ?c.GdkRectangle {
@@ -528,9 +661,14 @@ fn copy(popup: *Popup) void {
         .stderr = .ignore,
     }) catch |err| {
         std.debug.print("Could not run wl-copy: {t}\n", .{err});
+        c.gtk_button_set_label(popup.copy_button, "Copy failed");
         return;
     };
-    const term = child.wait(popup.io) catch return;
+    const term = child.wait(popup.io) catch |err| {
+        std.debug.print("wl-copy failed: {t}\n", .{err});
+        c.gtk_button_set_label(popup.copy_button, "Copy failed");
+        return;
+    };
     const ok = term == .exited and term.exited == 0;
     c.gtk_button_set_label(popup.copy_button, if (ok) "Copied" else "Copy failed");
 }
@@ -569,4 +707,41 @@ test languageName {
     try std.testing.expectEqualStrings("Deutsch", try languageName(gpa, "de"));
     try std.testing.expectEqualStrings("繁體中文", try languageName(gpa, "ZH-tw"));
     try std.testing.expectEqualStrings("XX-YY", try languageName(gpa, "xx-yy"));
+}
+
+test clampPosition {
+    const size: [2]c_int = .{ 584, 200 };
+    const area: [2]c_int = .{ 1920, 1080 };
+    // Inside: unchanged.
+    try std.testing.expectEqual([2]c_int{ 100, 80 }, clampPosition(.{ 100, 80 }, size, area));
+    // Exactly at the far edges: unchanged.
+    try std.testing.expectEqual([2]c_int{ 1336, 880 }, clampPosition(.{ 1336, 880 }, size, area));
+    // Past the right and bottom edges (or a smaller monitor): pulled back.
+    try std.testing.expectEqual([2]c_int{ 1336, 880 }, clampPosition(.{ 3000, 2000 }, size, area));
+    // A popup that grew past the bottom moves up just enough.
+    try std.testing.expectEqual([2]c_int{ 100, 780 }, clampPosition(.{ 100, 780 }, .{ 584, 300 }, area));
+    try std.testing.expectEqual([2]c_int{ 100, 780 }, clampPosition(.{ 100, 850 }, .{ 584, 300 }, area));
+    // Negative: to the edge.
+    try std.testing.expectEqual([2]c_int{ 0, 0 }, clampPosition(.{ -40, -1 }, size, area));
+    // Bigger than the monitor: top-left corner.
+    try std.testing.expectEqual([2]c_int{ 0, 0 }, clampPosition(.{ 50, 50 }, .{ 2000, 1200 }, area));
+}
+
+test translationCap {
+    // A normal monitor: the fixed maximum.
+    try std.testing.expectEqual(max_translation_height, translationCap(1080, 156));
+    // A small one: what is left below the top margin.
+    try std.testing.expectEqual(500 - top_margin - 156, translationCap(500, 156));
+    // Tiny: never below the minimum.
+    try std.testing.expectEqual(min_translation_height, translationCap(200, 156));
+}
+
+test previewText {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    try std.testing.expectEqualStrings("one two three", try previewText(gpa, "one\ntwo\r\n\n  three\n"));
+    try std.testing.expectEqualStrings("a b", try previewText(gpa, "\ta\x0cb "));
+    try std.testing.expectEqualStrings("Merhaba dünya", try previewText(gpa, "Merhaba dünya"));
+    try std.testing.expectEqualStrings("", try previewText(gpa, " \n "));
 }

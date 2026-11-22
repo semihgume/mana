@@ -10,8 +10,19 @@ pub const Translation = struct {
     target_lang: []const u8,
     /// Which service actually produced this text.
     service: Service,
-    /// True when a DeepL backend was configured but failed and Google answered.
-    fell_back: bool = false,
+    /// Set when a DeepL backend was configured but Google answered: why.
+    fell_back: ?Fallback = null,
+};
+
+pub const Fallback = enum {
+    /// DeepL was asked and failed.
+    deepl_failed,
+    /// The text is over DeepL's limit (for deepl-web it was never sent).
+    too_long,
+
+    fn of(err: anyerror) Fallback {
+        return if (err == error.TextTooLong) .too_long else .deepl_failed;
+    }
 };
 
 /// A translation service. Each variant carries whatever state its backend
@@ -32,12 +43,44 @@ pub const Backend = union(enum) {
     }
 };
 
+/// A sentence for the user about a failed translation. Errors without a
+/// sentence of their own keep their name in parentheses, so they stay
+/// diagnosable.
+pub fn describeError(gpa: Allocator, err: anyerror) Allocator.Error![:0]const u8 {
+    return switch (err) {
+        // AddressUnavailable: no local IPv6 (or IPv4) address, as when offline.
+        error.NetworkDown, error.NetworkUnreachable, error.AddressUnavailable => "No network connection.",
+        error.UnknownHostName, error.NameServerFailure, error.NoAddressReturned => "Could not look up the translation service. Is the internet connection working?",
+        error.ConnectionRefused, error.HostUnreachable, error.Timeout => "Could not connect to the translation service.",
+        error.ConnectionResetByPeer, error.ReadFailed, error.HttpConnectionClosing, error.HttpRequestTruncated => "The connection to the translation service broke off.",
+        error.TlsInitializationFailed => "Could not set up a secure connection to the translation service.",
+        error.TimedOut => "The translation service did not answer in time.",
+        error.TextTooLong => "The text is too long to translate.",
+        error.TooManyRequests => "The translation service got too many requests from this computer. Try again later.",
+        error.ServiceRefused => "The translation service refused the request.",
+        error.ServiceUnavailable => "The translation service is not available right now. Try again later.",
+        error.UnexpectedResponse => "The translation service sent an unexpected response.",
+        else => gpa.printSentinel("Translation failed ({t}).", .{err}, 0),
+    };
+}
+
+/// Turns a non-OK HTTP status into an error `describeError` has a sentence for.
+fn statusError(status: std.http.Status) error{ TextTooLong, TooManyRequests, ServiceRefused, ServiceUnavailable, UnexpectedResponse } {
+    return switch (@backingInt(status)) {
+        413, 414 => error.TextTooLong,
+        429 => error.TooManyRequests,
+        400...412, 415...428, 430...499 => error.ServiceRefused,
+        500...599 => error.ServiceUnavailable,
+        else => error.UnexpectedResponse,
+    };
+}
+
 /// Answers a failed DeepL request with Google, except when memory ran out.
 fn fallBackToGoogle(gpa: Allocator, io: Io, err: anyerror, name: []const u8, text: []const u8, target_lang: []const u8) !Translation {
     if (err == error.OutOfMemory) return error.OutOfMemory;
     std.debug.print("{s} failed ({t}), falling back to Google\n", .{ name, err });
     var result = try google.translate(gpa, io, text, target_lang);
-    result.fell_back = true;
+    result.fell_back = .of(err);
     return result;
 }
 
@@ -67,24 +110,27 @@ fn sameLanguage(a: []const u8, b: []const u8) bool {
 
 const google = struct {
     fn translate(gpa: Allocator, io: Io, text: []const u8, target_lang: []const u8) !Translation {
-        var url: Io.Writer.Allocating = .init(gpa);
-        try url.writer.print(
-            "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&dt=t&tl={s}&q=",
-            .{target_lang},
-        );
-        try std.Uri.Component.percentEncode(&url.writer, text, isUnreserved);
+        const url = try gpa.print("https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&dt=t&tl={s}", .{target_lang});
+        // The text goes in a form-encoded POST body: in the URL, the server
+        // answers HTTP 400 somewhere above 6000 characters.
+        var payload: Io.Writer.Allocating = .init(gpa);
+        try payload.writer.writeAll("q=");
+        try std.Uri.Component.percentEncode(&payload.writer, text, isUnreserved);
 
         var client: std.http.Client = .{ .allocator = gpa, .io = io };
         defer client.deinit();
 
         var body: Io.Writer.Allocating = .init(gpa);
         const response = try client.fetch(.{
-            .location = .{ .url = url.written() },
+            .location = .{ .url = url },
+            .method = .POST,
+            .payload = payload.written(),
+            .headers = .{ .content_type = .{ .override = "application/x-www-form-urlencoded" } },
             .response_writer = &body.writer,
         });
         if (response.status != .ok) {
-            std.debug.print("Translation request failed: HTTP {d}\n", .{@backingInt(response.status)});
-            return error.TranslationFailed;
+            std.debug.print("Google request failed: HTTP {d}\n", .{@backingInt(response.status)});
+            return statusError(response.status);
         }
 
         const result = try parseResponse(gpa, body.written());
@@ -93,7 +139,10 @@ const google = struct {
 
     /// Response shape: [[["translated","original",...],...], null, "source-lang", ...]
     fn parseResponse(gpa: Allocator, json: []const u8) !struct { text: []const u8, source_lang: []const u8 } {
-        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, gpa, json, .{});
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, gpa, json, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedResponse,
+        };
         if (parsed != .array or parsed.array.items.len < 3) return error.UnexpectedResponse;
         const root = parsed.array.items;
         if (root[0] != .array) return error.UnexpectedResponse;
@@ -137,7 +186,7 @@ const deepl = struct {
         });
         if (response.status != .ok) {
             std.debug.print("DeepL request failed: HTTP {d}\n", .{@backingInt(response.status)});
-            return error.TranslationFailed;
+            return statusError(response.status);
         }
 
         const result = try parseResponse(gpa, body.written());
@@ -222,11 +271,21 @@ const deepl_web = struct {
         });
         if (response.status != .ok) {
             std.debug.print("DeepL web request failed: HTTP {d}\n", .{@backingInt(response.status)});
-            return error.TranslationFailed;
+            return statusError(response.status);
         }
 
         const result = try parseResponse(gpa, body.written());
+        try rejectEcho(text, result.text, result.source_lang, target_lang);
         return .{ .text = result.text, .source_lang = result.source_lang, .target_lang = target_lang, .service = .deepl_web };
+    }
+
+    /// The endpoint has been seen to answer with the input text unchanged.
+    /// That only counts as a translation when the text already is in the
+    /// target language.
+    fn rejectEcho(input: []const u8, output: []const u8, source_lang: []const u8, target_lang: []const u8) error{EchoedInput}!void {
+        const space = " \t\r\n";
+        const same_text = std.mem.eql(u8, std.mem.trim(u8, input, space), std.mem.trim(u8, output, space));
+        if (same_text and !sameLanguage(source_lang, target_lang)) return error.EchoedInput;
     }
 
     /// Maps the app's Google-style code to the endpoint's: lowercase language,
@@ -362,4 +421,55 @@ test "deepl_web.parseResponse rejects empty or malformed responses" {
     try std.testing.expectError(error.UnexpectedResponse, deepl_web.parseResponse(gpa, "{\"translations\":[{\"detected_source_language\":\"en\",\"text\":\"\"}]}"));
     try std.testing.expectError(error.UnexpectedResponse, deepl_web.parseResponse(gpa, "{\"code\":429,\"message\":\"Too many requests.\"}"));
     try std.testing.expectError(error.UnexpectedResponse, deepl_web.parseResponse(gpa, "not json"));
+}
+
+test "deepl_web.rejectEcho: an untranslated answer only passes in the target language" {
+    // Echo of English text asked for Turkish: a failure, so Google takes over.
+    try std.testing.expectError(error.EchoedInput, deepl_web.rejectEcho("Hello world", "Hello world\n", "en", "tr"));
+    // Already Turkish and asked for Turkish: the same text is the right answer.
+    try deepl_web.rejectEcho(" Merhaba dünya", "Merhaba dünya", "tr", "tr");
+    try deepl_web.rejectEcho("Hello", "Hello", "en", "en-US");
+    // A normal translation.
+    try deepl_web.rejectEcho("Hello world", "Merhaba dünya", "en", "tr");
+}
+
+test "google.parseResponse rejects malformed responses" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    try std.testing.expectError(error.UnexpectedResponse, google.parseResponse(gpa, "<html>Sorry</html>"));
+    try std.testing.expectError(error.UnexpectedResponse, google.parseResponse(gpa, "{\"error\":1}"));
+    try std.testing.expectError(error.UnexpectedResponse, google.parseResponse(gpa, "[null,null,\"en\"]"));
+}
+
+test "statusError sorts HTTP statuses" {
+    try std.testing.expectEqual(error.TextTooLong, statusError(.payload_too_large));
+    try std.testing.expectEqual(error.TextTooLong, statusError(.uri_too_long));
+    try std.testing.expectEqual(error.TooManyRequests, statusError(.too_many_requests));
+    try std.testing.expectEqual(error.ServiceRefused, statusError(.forbidden));
+    try std.testing.expectEqual(error.ServiceRefused, statusError(@fromBackingInt(456)));
+    try std.testing.expectEqual(error.ServiceUnavailable, statusError(.service_unavailable));
+    try std.testing.expectEqual(error.UnexpectedResponse, statusError(.found));
+}
+
+test describeError {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    try std.testing.expectEqualStrings("No network connection.", try describeError(gpa, error.NetworkUnreachable));
+    try std.testing.expectEqualStrings("The text is too long to translate.", try describeError(gpa, error.TextTooLong));
+    try std.testing.expectEqualStrings("Translation failed (HttpChunkInvalid).", try describeError(gpa, error.HttpChunkInvalid));
+}
+
+test "Fallback.of: only a too-long text is told apart" {
+    try std.testing.expectEqual(Fallback.too_long, Fallback.of(error.TextTooLong));
+    try std.testing.expectEqual(Fallback.deepl_failed, Fallback.of(error.ServiceUnavailable));
+    try std.testing.expectEqual(Fallback.deepl_failed, Fallback.of(error.TooManyRequests));
+}
+
+test "deepl_web refuses text over its limit before any request" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const text: [deepl_web.max_text_len + 1]u8 = @splat('a');
+    try std.testing.expectError(error.TextTooLong, deepl_web.translate(arena.allocator(), std.testing.io, &text, "tr"));
 }

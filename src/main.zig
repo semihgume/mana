@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const config = @import("config.zig");
 const selection = @import("selection.zig");
+const state = @import("state.zig");
 const translator = @import("translator.zig");
 const ui = @import("ui.zig");
 
@@ -49,7 +50,12 @@ pub fn main(init: std.process.Init) !void {
         try std.mem.join(arena, " ", words.items)
     else
         selection.read(arena, io) catch |err| blk: {
-            problem = try arena.print("Could not read the selection: {t}", .{err});
+            problem = switch (err) {
+                error.FileNotFound => "wl-paste was not found. Install wl-clipboard to translate the selection.",
+                error.Timeout => "Could not read the selection: the application that owns it did not answer.",
+                error.NotText => "The selection is not text.",
+                else => try arena.print("Could not read the selection ({t}).", .{err}),
+            };
             break :blk "";
         };
     if (problem == null and text.len == 0) problem = "No text selected.";
@@ -69,6 +75,7 @@ pub fn main(init: std.process.Init) !void {
         .backend = backend,
         .options = options,
         .languages = settings.languages,
+        .position_path = try state.positionPath(arena, init.environ_map),
     });
 
     if (problem) |message| {
@@ -76,24 +83,44 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
-    const result = try translator.translateSmart(backend, arena, io, text, options);
+    const result = translator.translateSmart(backend, arena, io, text, options) catch |err| {
+        std.debug.print("{s}\n", .{try translator.describeError(arena, err)});
+        std.process.exit(1);
+    };
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
-    const service: []const u8 = if (result.fell_back)
-        ", Google: DeepL failed"
-    else switch (result.service) {
+    try stdout.print("[{s} -> {s}{s}]\n{s}\n", .{ result.source_lang, result.target_lang, serviceLabel(result), result.text });
+    try stdout.flush();
+}
+
+/// The part of the `--print` header that names the service.
+fn serviceLabel(result: translator.Translation) []const u8 {
+    if (result.fell_back) |reason| return switch (reason) {
+        .deepl_failed => ", Google: DeepL failed",
+        .too_long => ", Google: too long for DeepL",
+    };
+    return switch (result.service) {
         .google => "",
         .deepl => ", DeepL",
         .deepl_web => ", DeepL web",
     };
-    try stdout.print("[{s} -> {s}{s}]\n{s}\n", .{ result.source_lang, result.target_lang, service, result.text });
-    try stdout.flush();
+}
+
+test serviceLabel {
+    var result: translator.Translation = .{ .text = "", .source_lang = "en", .target_lang = "tr", .service = .deepl_web };
+    try std.testing.expectEqualStrings(", DeepL web", serviceLabel(result));
+    result = .{ .text = "", .source_lang = "en", .target_lang = "tr", .service = .google, .fell_back = .too_long };
+    try std.testing.expectEqualStrings(", Google: too long for DeepL", serviceLabel(result));
+    result.fell_back = .deepl_failed;
+    try std.testing.expectEqualStrings(", Google: DeepL failed", serviceLabel(result));
 }
 
 test {
     _ = config;
+    _ = selection;
+    _ = state;
     _ = translator;
     _ = ui;
 }

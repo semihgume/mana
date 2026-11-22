@@ -13,6 +13,21 @@ pub fn build(b: *std.Build) void {
     // otherwise its protocol hooks are never used and windows stay plain toplevels.
     c.linkSystemLibrary("gtk4-layer-shell-0", .{});
     c.linkSystemLibrary("gtk4", .{});
+    c.linkSystemLibrary("wayland-client", .{});
+
+    // Client glue for the ext-data-control protocol, used to read the selection
+    // without a focused window: a header for src/c.h and the interface tables.
+    const protocol = b.path("protocol/ext-data-control-v1.xml");
+    const scan_header = b.addSystemCommand(&.{ "wayland-scanner", "client-header" });
+    scan_header.addFileArg(protocol);
+    const protocol_header = scan_header.addOutputFileArg("ext-data-control-v1-client-protocol.h");
+    const scan_code = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
+    scan_code.addFileArg(protocol);
+    const protocol_code = scan_code.addOutputFileArg("ext-data-control-v1-protocol.c");
+    c.addIncludePath(protocol_header.dirname());
+
+    const c_module = c.createModule();
+    c_module.addCSourceFile(.{ .file = protocol_code });
 
     const exe = b.addExecutable(.{
         .name = "mana",
@@ -20,7 +35,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "c", .module = c.createModule() }},
+            .imports = &.{.{ .name = "c", .module = c_module }},
         }),
     });
     b.installArtifact(exe);

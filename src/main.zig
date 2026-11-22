@@ -60,6 +60,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("mana: config: backend = deepl needs deepl_key; using Google\n", .{});
             break :blk .google;
         },
+        .deepl_web => .deepl_web,
     };
 
     if (!print_mode) try ui.run(arena, io, .{
@@ -85,6 +86,7 @@ pub fn main(init: std.process.Init) !void {
     else switch (result.service) {
         .google => "",
         .deepl => ", DeepL",
+        .deepl_web => ", DeepL web",
     };
     try stdout.print("[{s} -> {s}{s}]\n{s}\n", .{ result.source_lang, result.target_lang, service, result.text });
     try stdout.flush();

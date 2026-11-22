@@ -2,7 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-pub const BackendKind = enum { google, deepl };
+pub const BackendKind = enum { google, deepl, deepl_web };
 
 /// Same codes and order as the language picker in ui.zig.
 const default_languages = [_][]const u8{ "tr", "en", "de", "fr", "es", "it", "ru", "ar", "ja", "zh-CN" };
@@ -42,6 +42,8 @@ pub fn parse(arena: Allocator, text: []const u8, warnings: *std.ArrayList([]cons
                 config.backend = .google;
             } else if (std.ascii.eqlIgnoreCase(value, "deepl")) {
                 config.backend = .deepl;
+            } else if (std.ascii.eqlIgnoreCase(value, "deepl-web") or std.ascii.eqlIgnoreCase(value, "deepl_web")) {
+                config.backend = .deepl_web;
             } else {
                 try warnings.append(arena, try arena.print("line {d}: unknown backend \"{s}\"", .{ line_number, value }));
             }
@@ -151,6 +153,18 @@ test "parse: comments, blank lines, CRLF and extra whitespace" {
     try testing.expectEqual(0, warnings.items.len);
     try testing.expectEqualStrings("ja", config.native);
     try testing.expectEqual(BackendKind.deepl, config.backend);
+}
+
+test "parse: deepl-web backend, either spelling, needs no key" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var warnings: std.ArrayList([]const u8) = .empty;
+    const dashed = try parse(arena.allocator(), "backend = DeepL-Web\n", &warnings);
+    try testing.expectEqual(BackendKind.deepl_web, dashed.backend);
+    try testing.expectEqual(null, dashed.deepl_key);
+    const underscored = try parse(arena.allocator(), "backend = deepl_web\n", &warnings);
+    try testing.expectEqual(BackendKind.deepl_web, underscored.backend);
+    try testing.expectEqual(0, warnings.items.len);
 }
 
 test "parse: unknown key and missing = warn with line numbers" {

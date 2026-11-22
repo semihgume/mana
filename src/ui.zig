@@ -316,6 +316,7 @@ fn translate(job: *Job) !Outcome {
     else switch (result.service) {
         .google => "",
         .deepl => " · DeepL",
+        .deepl_web => " · DeepL web",
     };
     return .{ .translated = .{
         .direction = try gpa.printSentinel("{s} → {s}{s}", .{ source, target, service }, 0),
